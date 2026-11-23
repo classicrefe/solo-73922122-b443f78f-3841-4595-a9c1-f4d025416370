@@ -70,6 +70,7 @@ class ImportSummary(BaseModel):
 class ImportResponse(BaseModel):
     summary: ImportSummary
     watermark: str
+    grouping_rebuilt: bool = False
     new_revision_no: int | None
     changes: list[ChangeOut]
     published: list[SessionOut]

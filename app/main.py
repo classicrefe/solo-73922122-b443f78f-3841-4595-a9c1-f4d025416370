@@ -177,6 +177,7 @@ def import_events(body: ImportRequest, db: Session = Depends(get_db)):
     return ImportResponse(
         summary=ImportSummary(**result["summary"]),
         watermark=fmt_ts(cfg.watermark),
+        grouping_rebuilt=result.get("grouping_rebuilt", False),
         new_revision_no=result["new_revision_no"],
         changes=_changes_from_result(result),
         published=_sessions_from_result(result, "published_dicts"),
@@ -224,26 +225,27 @@ def list_events(user_id: str, db: Session = Depends(get_db)):
 
 @app.get("/api/users/{user_id}/sessions", response_model=list[SessionOut])
 def current_sessions(user_id: str, db: Session = Depends(get_db)):
-    rev = service.latest_revision(db, user_id)
-    if rev is not None:
-        snaps = sorted(rev.sessions, key=lambda s: (s.start_time, s.session_key))
-        return [serialize_session(s) for s in snaps]
-    # No revision yet: derive pending sessions on the fly from raw events.
-    cfg = service.get_or_create_user(db, user_id)
-    db.commit()
-    from app.models import Event
-    from sqlalchemy import select
-
-    events = list(
-        db.scalars(
-            select(Event).where(Event.user_id == user_id)
-        ).all()
-    )
-    sessions = service.classify_sessions(
-        service.sessionize(events, cfg.idle_gap_seconds),
-        cfg.watermark,
-        cfg.idle_gap_seconds,
-    )
+    # The no-revision path may lazily build the grouping (a write), so it is
+    # serialized with the other per-user writes.
+    with service.user_lock(user_id):
+        try:
+            cfg = service.get_or_create_user(db, user_id)
+            rev = service.latest_revision(db, user_id)
+            if rev is not None:
+                db.commit()
+                snaps = sorted(
+                    rev.sessions, key=lambda s: (s.start_time, s.session_key)
+                )
+                return [serialize_session(s) for s in snaps]
+            # No revision yet: classify the cached grouping instead of
+            # rescanning the raw events (built on first use when needed).
+            sessions = service.current_sessions(
+                db, user_id, cfg.idle_gap_seconds, cfg.watermark
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
     return [_session_from_dict(s) for s in sessions]
 
 

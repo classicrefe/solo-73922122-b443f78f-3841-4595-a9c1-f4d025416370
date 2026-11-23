@@ -18,11 +18,14 @@ from sqlalchemy.orm import Session
 from app.models import (
     EPOCH,
     Event,
+    GroupedSession,
     Revision,
     RevisionChange,
+    SessionGrouping,
     SessionSnapshot,
     UserConfig,
     to_utc,
+    utc_now,
 )
 
 # Test hook: when True, the next write that would create a revision raises
@@ -118,6 +121,133 @@ def classify_sessions(
 def _load_user_events(db: Session, user_id: str) -> list[Event]:
     return list(
         db.scalars(select(Event).where(Event.user_id == user_id)).all()
+    )
+
+
+def _event_signature(db: Session, user_id: str) -> tuple[int, int]:
+    """Event count and highest row id, recorded with the grouping metadata.
+
+    They are stored for diagnostics and integrity checks; advancement does
+    not query them, because every writer that mutates events also replaces
+    the grouping in the same transaction.
+    """
+    count, max_id = db.execute(
+        select(func.count(Event.id), func.coalesce(func.max(Event.id), 0)).where(
+            Event.user_id == user_id
+        )
+    ).one()
+    return int(count), int(max_id)
+
+
+def _persist_grouping(
+    db: Session, user_id: str, idle_gap_seconds: int, sessions: list[dict]
+) -> SessionGrouping:
+    """Replace the cached grouping of a user inside the current transaction."""
+    event_count, max_event_id = _event_signature(db, user_id)
+
+    db.query(GroupedSession).filter(GroupedSession.user_id == user_id).delete(
+        synchronize_session=False
+    )
+    grouping = db.get(SessionGrouping, user_id)
+    if grouping is None:
+        grouping = SessionGrouping(user_id=user_id)
+        db.add(grouping)
+    grouping.idle_gap_seconds = idle_gap_seconds
+    grouping.event_count = event_count
+    grouping.max_event_id = max_event_id
+    grouping.session_count = len(sessions)
+    grouping.built_at = utc_now()
+    db.flush()
+
+    for seq, sess in enumerate(sessions):
+        db.add(
+            GroupedSession(
+                user_id=user_id,
+                seq=seq,
+                session_key=sess["session_key"],
+                start_time=sess["start"],
+                end_time=sess["end"],
+                event_ids=",".join(sess["event_ids"]),
+            )
+        )
+    db.flush()
+    return grouping
+
+
+def _cached_sessions(db: Session, user_id: str) -> list[dict] | None:
+    """Return the stored grouping as session dicts, or None if missing.
+
+    No event scan is performed here: the signature stored with the grouping
+    is trusted, because every code path that mutates events rebuilds it in
+    the same transaction.
+    """
+    grouping = db.get(SessionGrouping, user_id)
+    if grouping is None:
+        return None
+    rows = db.scalars(
+        select(GroupedSession)
+        .where(GroupedSession.user_id == user_id)
+        .order_by(GroupedSession.seq)
+    ).all()
+    if len(rows) != grouping.session_count:
+        return None
+    return [
+        {
+            "session_key": row.session_key,
+            "start": row.start_time,
+            "end": row.end_time,
+            "event_ids": row.event_ids.split(",") if row.event_ids else [],
+        }
+        for row in rows
+    ]
+
+
+def _grouping_for(
+    db: Session, user_id: str, idle_gap_seconds: int
+) -> tuple[list[dict], bool]:
+    """Cached grouping for the current gap, rebuilding when needed.
+
+    The cache is reused when it was built for the same idle interval.
+    Old databases (no grouping yet) and gap changes rebuild it from the raw
+    events on first use, in the caller's transaction.
+    """
+    grouping = db.get(SessionGrouping, user_id)
+    if grouping is not None and grouping.idle_gap_seconds == idle_gap_seconds:
+        cached = _cached_sessions(db, user_id)
+        if cached is not None:
+            return cached, False
+
+    sessions = sessionize(_load_user_events(db, user_id), idle_gap_seconds)
+    _persist_grouping(db, user_id, idle_gap_seconds, sessions)
+    return sessions, True
+
+
+def _maybe_build_grouping(
+    db: Session, user_id: str, idle_gap_seconds: int
+) -> list[dict]:
+    """Cheap helper: only touch the cache if one exists or events are present."""
+    grouping = db.get(SessionGrouping, user_id)
+    if grouping is None:
+        count, _ = _event_signature(db, user_id)
+        if count == 0:
+            return []
+    sessions, _rebuilt = _grouping_for(db, user_id, idle_gap_seconds)
+    return sessions
+
+
+def current_sessions(
+    db: Session, user_id: str, idle_gap_seconds: int, watermark: datetime
+) -> list[dict]:
+    """Sessions with their status under the current watermark.
+
+    Served from the persisted grouping; the raw events are only read when
+    the grouping must be built for the first time (old database or a new
+    idle interval). May write the cache, so callers hold the user lock.
+    """
+    return classify_sessions(
+        _maybe_build_grouping(db, user_id, idle_gap_seconds),
+        watermark,
+        idle_gap_seconds,
     )
 
 
@@ -250,8 +380,9 @@ def _state_dicts(
     """Current published/pending sessions and the latest revision number.
 
     When no revision exists yet (nothing was ever published/retracted), the
-    state is derived on the fly from the raw events so the API still reports
-    pending sessions before the first publish.
+    state is classified from the cached grouping; the raw events are only
+    read when the grouping must be built for the first time (old database or
+    a new idle interval).
     """
     rev = latest_revision(db, user_id)
     if rev is not None:
@@ -264,7 +395,7 @@ def _state_dicts(
         return published, pending, rev.revision_no
 
     sessions = classify_sessions(
-        sessionize(_load_user_events(db, user_id), idle_gap_seconds),
+        _maybe_build_grouping(db, user_id, idle_gap_seconds),
         watermark,
         idle_gap_seconds,
     )
@@ -352,6 +483,7 @@ def import_events(
 
     if inserted == 0:
         # Fully idempotent replay: nothing changes, no revision is created.
+        # The stored grouping stays valid; raw events are not scanned again.
         db.flush()
         published, pending, _rev_no = _state_dicts(
             db, user_id, cfg.idle_gap_seconds, cfg.watermark
@@ -364,6 +496,7 @@ def import_events(
                 "duplicate": duplicate,
                 "conflicts": [],
             },
+            "grouping_rebuilt": False,
             "new_revision_no": None,
             "retractions": [],
             "additions": [],
@@ -377,12 +510,17 @@ def import_events(
         db.rollback()
         raise ApiError(409, "concurrent conflicting import") from exc
 
-    all_events = _load_user_events(db, user_id)
+    # New events invalidate the cached grouping: rebuild it from the raw
+    # events inside this same transaction. Besides feeding this response,
+    # this guarantees the next watermark advance uses the post-import
+    # grouping even when the import only moved pending sessions and created
+    # no revision.
     new_sessions = classify_sessions(
-        sessionize(all_events, cfg.idle_gap_seconds),
+        sessionize(_load_user_events(db, user_id), cfg.idle_gap_seconds),
         cfg.watermark,
         cfg.idle_gap_seconds,
     )
+    _persist_grouping(db, user_id, cfg.idle_gap_seconds, new_sessions)
 
     prev = latest_revision(db, user_id)
     old_published = _published_map(prev.sessions) if prev else {}
@@ -417,6 +555,7 @@ def import_events(
             "duplicate": duplicate,
             "conflicts": [],
         },
+        "grouping_rebuilt": True,
         "new_revision_no": new_rev_no,
         "retractions": retractions,
         "additions": additions,
@@ -457,9 +596,11 @@ def advance_watermark(
     cfg.watermark = new_watermark
     db.flush()
 
-    all_events = _load_user_events(db, user_id)
+    # Pure watermark advancement: read only the stored grouping. Raw events
+    # are touched solely when the grouping is absent (old database) or was
+    # built for a different idle interval.
     new_sessions = classify_sessions(
-        sessionize(all_events, cfg.idle_gap_seconds),
+        _grouping_for(db, user_id, cfg.idle_gap_seconds)[0],
         cfg.watermark,
         cfg.idle_gap_seconds,
     )

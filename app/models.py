@@ -126,6 +126,55 @@ class Event(Base):
     )
 
 
+class SessionGrouping(Base):
+    """Cached sessionization of a user's events for one idle gap.
+
+    Watermark advancement only needs the grouping, not the raw events. The
+    cache is rebuilt lazily (old databases, changed idle gap) and replaced in
+    the same transaction as the event import that changes it, so a rollback
+    always restores both the previous events and the previous grouping.
+    """
+
+    __tablename__ = "session_grouping"
+
+    user_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    idle_gap_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_event_id: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    session_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    built_at: Mapped[datetime] = mapped_column(TZDateTime, nullable=False, default=utc_now)
+
+    sessions: Mapped[list["GroupedSession"]] = relationship(
+        back_populates="grouping",
+        cascade="all, delete-orphan",
+        order_by="GroupedSession.seq",
+    )
+
+
+class GroupedSession(Base):
+    """One cached session (no status: status is derived from the watermark)."""
+
+    __tablename__ = "grouped_session"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("session_grouping.user_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    session_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    start_time: Mapped[datetime] = mapped_column(TZDateTime, nullable=False)
+    end_time: Mapped[datetime] = mapped_column(TZDateTime, nullable=False)
+    event_ids: Mapped[str] = mapped_column(Text, nullable=False)  # comma separated
+
+    grouping: Mapped[SessionGrouping] = relationship(back_populates="sessions")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "seq", name="uq_grouped_session_seq"),
+    )
+
+
 class Revision(Base):
     __tablename__ = "revision"
 

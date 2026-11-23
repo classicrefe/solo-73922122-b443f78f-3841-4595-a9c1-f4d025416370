@@ -18,14 +18,26 @@ def _throwaway_engine():
 
 
 @pytest.fixture()
-def client(tmp_path):
-    """Each test gets an isolated SQLite database."""
+def engine(tmp_path):
+    """Isolated SQLite engine for one test."""
     engine = create_engine(
         f"sqlite:///{tmp_path / 'test.db'}",
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
-    test_session = sessionmaker(bind=engine, future=True)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture()
+def session_factory(engine):
+    return sessionmaker(bind=engine, future=True)
+
+
+@pytest.fixture()
+def client(engine, session_factory):
+    """Each test gets an isolated SQLite database."""
+    test_session = session_factory
 
     def override_get_db():
         db = test_session()
